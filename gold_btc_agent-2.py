@@ -17,6 +17,7 @@ import pytz
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "your_bot_token_here")
 TELEGRAM_CHANNEL   = os.environ.get("TELEGRAM_CHANNEL", "8867873147")
 TWELVE_DATA_KEY    = os.environ.get("TWELVE_DATA_API_KEY", "your_twelvedata_key_here")
+GOOGLE_SHEETS_URL  = os.environ.get("GOOGLE_SHEETS_URL", "https://script.google.com/macros/s/AKfycbwHL0wYdyUvh_eDRtJzgEn5BvZbOFWiDEUF_33TdsI7K7fWSxPnuzlVpLW00F6LJaDc/exec")
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -47,6 +48,11 @@ NEWS_KEYWORDS = [
 
 _alerted_news_ids = set()
 _bias_report_sent_date = None
+
+# Trade journal - stores completed trades for performance tracking
+# Each entry: {"asset", "direction", "entry", "result", "r_multiple", "time"}
+_trade_journal = []
+_journal_report_sent_date = None
 
 
 def send_telegram(message):
@@ -339,16 +345,42 @@ def format_setup_alert(asset_key, fib_level, bias, session):
 
 def format_tp_sl_hit(asset_key, trade, hit_type, hit_price):
     asset = ASSETS[asset_key]
-    icons = {"TP1": "\U0001F3AF\u2705", "TP2": "\U0001F3AF\U0001F3C6", "SL": "\U0001F6D1\u274C"}
+    icons = {
+        "TP1": "\U0001F3AF\u2705",
+        "TP2": "\U0001F3AF\U0001F3C6",
+        "SL": "\U0001F6D1\u274C",
+        "BREAKEVEN": "\u2696\uFE0F",
+    }
     icon = icons.get(hit_type, "\u2139\uFE0F")
-    pnl_label = "PROFIT" if hit_type in ("TP1", "TP2") else "LOSS"
+    if hit_type in ("TP1", "TP2"):
+        pnl_label = "PROFIT"
+    elif hit_type == "BREAKEVEN":
+        pnl_label = "NO LOSS (Breakeven Exit)"
+    else:
+        pnl_label = "LOSS"
+
+    display_type = "BREAKEVEN EXIT" if hit_type == "BREAKEVEN" else hit_type
+
     return (
-        f"{icon} <b>{hit_type} HIT</b> | {asset['emoji']} {asset['name']}\n"
+        f"{icon} <b>{display_type} HIT</b> | {asset['emoji']} {asset['name']}\n"
         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
         f"\U0001F4CD <b>Entry was:</b> {trade['entry']}\n"
-        f"\U0001F4B0 <b>{hit_type} Price:</b> {hit_price}\n"
+        f"\U0001F4B0 <b>Exit Price:</b> {hit_price}\n"
         f"\U0001F4CA <b>Direction:</b> {trade['direction']}\n"
         f"\U0001F3F7\uFE0F <b>Result:</b> {pnl_label}\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"<b>@Aigoldbitcoin_bot</b>"
+    )
+
+
+def format_breakeven_alert(asset_key, trade):
+    asset = ASSETS[asset_key]
+    return (
+        f"\u2696\uFE0F <b>RISK-FREE ACTIVATED</b> | {asset['emoji']} {asset['name']}\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"\U0001F4C8 <b>1:1.5 RR achieved</b>\n"
+        f"\U0001F6E1\uFE0F <b>SL moved to Entry:</b> {trade['entry']}\n"
+        f"\u2705 Trade is now risk-free. Worst case = breakeven.\n"
         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
         f"<b>@Aigoldbitcoin_bot</b>"
     )
@@ -369,6 +401,104 @@ def format_daily_bias_report(report_data):
             f"   Range Low: {info['low']}\n"
             f"   Fib 38.2%: {info['fib']}"
         )
+    lines.append("\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501")
+    lines.append("<b>@Aigoldbitcoin_bot</b>")
+    return "\n".join(lines)
+
+
+def send_to_google_sheets(trade_entry):
+    """Posts a completed trade row to the Google Sheets Apps Script web app."""
+    if not GOOGLE_SHEETS_URL:
+        return  # Not configured, skip silently
+
+    payload = {
+        "date": trade_entry["time"].strftime("%Y-%m-%d"),
+        "time": trade_entry["time"].strftime("%H:%M:%S"),
+        "asset": ASSETS[trade_entry["asset"]]["name"],
+        "direction": trade_entry["direction"],
+        "entry": trade_entry["entry"],
+        "exit": trade_entry["exit"],
+        "result": trade_entry["result"],
+        "r_multiple": trade_entry["r_multiple"],
+    }
+    try:
+        r = requests.post(GOOGLE_SHEETS_URL, json=payload, timeout=10)
+        print(f"[SHEETS] Logged trade: {payload['asset']} {payload['direction']} -> {payload['result']}")
+    except Exception as e:
+        print(f"[SHEETS ERROR] {e}")
+
+
+def log_trade_result(asset_key, trade, hit_type, hit_price):
+    """Logs a completed trade (TP2, SL, or BREAKEVEN final close) into the journal."""
+    if hit_type not in ("TP2", "SL", "BREAKEVEN"):
+        return  # Only log final outcomes, not partial TP1
+
+    direction = trade["direction"]
+    entry = trade["entry"]
+    # Use original SL distance (before breakeven shift) for accurate R-multiple
+    original_sl = trade.get("original_sl", trade["sl"])
+    sl_dist = abs(entry - original_sl)
+
+    if hit_type == "TP2":
+        result = "WIN"
+        r_multiple = round(abs(hit_price - entry) / sl_dist, 2) if sl_dist else 0
+    elif hit_type == "BREAKEVEN":
+        result = "BREAKEVEN"
+        r_multiple = 0.0
+    else:
+        result = "LOSS"
+        r_multiple = -1.0
+
+    new_entry = {
+        "asset": asset_key,
+        "direction": direction,
+        "entry": entry,
+        "exit": hit_price,
+        "result": result,
+        "r_multiple": r_multiple,
+        "time": datetime.now(IST),
+    }
+    _trade_journal.append(new_entry)
+    send_to_google_sheets(new_entry)
+    print(f"[JOURNAL] {asset_key} {direction} -> {result} ({r_multiple}R)")
+
+
+def format_journal_report(trades):
+    if not trades:
+        return (
+            "\U0001F4D2 <b>DAILY TRADE JOURNAL</b>\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            "No trades completed today.\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            "<b>@Aigoldbitcoin_bot</b>"
+        )
+
+    total = len(trades)
+    wins = sum(1 for t in trades if t["result"] == "WIN")
+    losses = sum(1 for t in trades if t["result"] == "LOSS")
+    breakevens = sum(1 for t in trades if t["result"] == "BREAKEVEN")
+    win_rate = round((wins / total) * 100, 1) if total else 0
+    net_r = round(sum(t["r_multiple"] for t in trades), 2)
+
+    icon_map = {"WIN": "\u2705", "LOSS": "\u274C", "BREAKEVEN": "\u2696\uFE0F"}
+
+    lines = [
+        "\U0001F4D2 <b>DAILY TRADE JOURNAL</b>",
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+    ]
+    for t in trades:
+        asset = ASSETS[t["asset"]]
+        icon = icon_map.get(t["result"], "\u2139\uFE0F")
+        lines.append(
+            f"{icon} {asset['emoji']} {asset['name']} {t['direction']} "
+            f"| Entry {t['entry']} -> Exit {t['exit']} "
+            f"| {t['r_multiple']:+.2f}R"
+        )
+    lines.append("\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501")
+    lines.append(f"\U0001F4CA <b>Total Trades:</b> {total}")
+    lines.append(f"\u2705 <b>Wins:</b> {wins}  \u274C <b>Losses:</b> {losses}  \u2696\uFE0F <b>Breakeven:</b> {breakevens}")
+    lines.append(f"\U0001F3AF <b>Win Rate:</b> {win_rate}%")
+    lines.append(f"\U0001F4B0 <b>Net R:</b> {net_r:+.2f}R")
     lines.append("\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501")
     lines.append("<b>@Aigoldbitcoin_bot</b>")
     return "\n".join(lines)
@@ -413,6 +543,25 @@ class FibAgent:
         _bias_report_sent_date = today
         print(f"[BIAS REPORT] Sent for {today}")
 
+    def send_daily_journal_report(self):
+        """Sends trade journal summary once per day after evening session ends (9:30 PM)."""
+        global _journal_report_sent_date
+        now = datetime.now(IST)
+
+        # Trigger after evening session ends
+        if (now.hour, now.minute) < (21, 30):
+            return
+
+        today = now.date()
+        if _journal_report_sent_date == today:
+            return
+
+        todays_trades = [t for t in _trade_journal if t["time"].date() == today]
+        msg = format_journal_report(todays_trades)
+        send_telegram(msg)
+        _journal_report_sent_date = today
+        print(f"[JOURNAL REPORT] Sent for {today} - {len(todays_trades)} trades")
+
     def check_news_alerts(self):
         events = check_news_events()
         for event in events:
@@ -432,27 +581,47 @@ class FibAgent:
         direction = trade["direction"]
 
         if direction == "BUY":
+            # Breakeven shift at 1:1.5 RR
+            if not trade.get("breakeven_done") and price >= trade["breakeven_trigger"]:
+                trade["sl"] = trade["entry"]
+                trade["breakeven_done"] = True
+                send_telegram(format_breakeven_alert(asset_key, trade))
+                print(f"[BREAKEVEN] {asset_key} SL moved to entry {trade['entry']}")
+
             if not trade.get("tp1_hit") and price >= trade["tp1"]:
                 send_telegram(format_tp_sl_hit(asset_key, trade, "TP1", price))
                 trade["tp1_hit"] = True
             if price >= trade["tp2"]:
                 send_telegram(format_tp_sl_hit(asset_key, trade, "TP2", price))
+                log_trade_result(asset_key, trade, "TP2", price)
                 self.active_trades[asset_key] = None
                 return
             if price <= trade["sl"]:
-                send_telegram(format_tp_sl_hit(asset_key, trade, "SL", price))
+                hit_label = "BREAKEVEN" if trade.get("breakeven_done") else "SL"
+                send_telegram(format_tp_sl_hit(asset_key, trade, hit_label, price))
+                log_trade_result(asset_key, trade, hit_label, price)
                 self.active_trades[asset_key] = None
                 return
         else:
+            # Breakeven shift at 1:1.5 RR
+            if not trade.get("breakeven_done") and price <= trade["breakeven_trigger"]:
+                trade["sl"] = trade["entry"]
+                trade["breakeven_done"] = True
+                send_telegram(format_breakeven_alert(asset_key, trade))
+                print(f"[BREAKEVEN] {asset_key} SL moved to entry {trade['entry']}")
+
             if not trade.get("tp1_hit") and price <= trade["tp1"]:
                 send_telegram(format_tp_sl_hit(asset_key, trade, "TP1", price))
                 trade["tp1_hit"] = True
             if price <= trade["tp2"]:
                 send_telegram(format_tp_sl_hit(asset_key, trade, "TP2", price))
+                log_trade_result(asset_key, trade, "TP2", price)
                 self.active_trades[asset_key] = None
                 return
             if price >= trade["sl"]:
-                send_telegram(format_tp_sl_hit(asset_key, trade, "SL", price))
+                hit_label = "BREAKEVEN" if trade.get("breakeven_done") else "SL"
+                send_telegram(format_tp_sl_hit(asset_key, trade, hit_label, price))
+                log_trade_result(asset_key, trade, hit_label, price)
                 self.active_trades[asset_key] = None
                 return
 
@@ -519,10 +688,19 @@ class FibAgent:
                 self.last_signal_time[asset_key] = datetime.now(IST)
                 self.sweep_alerted[asset_key] = False
 
+                # Calculate breakeven trigger level at 1:1.5 RR
+                sl_distance = signal["sl_dist"]
+                if signal["direction"] == "BUY":
+                    breakeven_trigger = signal["entry"] + (sl_distance * 1.5)
+                else:
+                    breakeven_trigger = signal["entry"] - (sl_distance * 1.5)
+
                 self.active_trades[asset_key] = {
                     "direction": signal["direction"], "entry": signal["entry"],
-                    "sl": signal["sl"], "tp1": signal["tp1"], "tp2": signal["tp2"],
-                    "tp1_hit": False,
+                    "sl": signal["sl"], "original_sl": signal["sl"],
+                    "tp1": signal["tp1"], "tp2": signal["tp2"],
+                    "tp1_hit": False, "breakeven_done": False,
+                    "breakeven_trigger": round(breakeven_trigger, 4),
                 }
                 print(f"[SIGNAL] {asset_key} {signal['direction']} @ {signal['entry']}")
         else:
@@ -548,6 +726,7 @@ class FibAgent:
             try:
                 self.check_news_alerts()
                 self.send_daily_bias_report()
+                self.send_daily_journal_report()
 
                 for asset_key in ASSETS:
                     self.run_asset(asset_key)
