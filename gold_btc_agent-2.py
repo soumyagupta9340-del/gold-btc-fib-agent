@@ -230,59 +230,99 @@ def detect_entry(df, sweep, bias, max_sl):
     return None
 
 
-def check_news_events():
-    events_found = []
+_news_cache = {"data": None, "fetched_at": None}
+
+
+def _fetch_news_calendar():
+    """
+    Fetches the ForexFactory weekly calendar with proper headers.
+    Caches result for 10 minutes to avoid hammering the API and
+    reduce chances of being rate-limited / blocked.
+    """
+    now = datetime.now(pytz.utc)
+    if _news_cache["data"] is not None and _news_cache["fetched_at"] is not None:
+        age = (now - _news_cache["fetched_at"]).total_seconds()
+        if age < 600:  # 10 minute cache
+            return _news_cache["data"]
+
+    url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept": "application/json",
+    }
     try:
-        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-        r = requests.get(url, timeout=10)
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code != 200:
+            print(f"[NEWS CHECK ERROR] HTTP {r.status_code} from ForexFactory")
+            return _news_cache["data"] or []
+
+        content_type = r.headers.get("Content-Type", "")
+        if "json" not in content_type and not r.text.strip().startswith(("[", "{")):
+            print("[NEWS CHECK ERROR] Non-JSON response received, skipping this cycle")
+            return _news_cache["data"] or []
+
         events = r.json()
-        now = datetime.now(pytz.utc)
-        for event in events:
-            if event.get("impact") != "High":
-                continue
-            title = event.get("title", "")
-            if not any(kw.lower() in title.lower() for kw in NEWS_KEYWORDS):
-                continue
-            try:
-                event_time = datetime.fromisoformat(event["date"].replace("Z", "+00:00"))
-                diff_min = (event_time - now).total_seconds() / 60
-                event_id = f"{title}_{event['date']}"
-                if 0 <= diff_min <= 60 and event_id not in _alerted_news_ids:
-                    events_found.append({
-                        "id": event_id, "title": title,
-                        "time_ist": event_time.astimezone(IST),
-                        "minutes_away": round(diff_min),
-                        "currency": event.get("country", ""),
-                    })
-            except Exception:
-                continue
+        _news_cache["data"] = events
+        _news_cache["fetched_at"] = now
+        return events
+    except requests.exceptions.JSONDecodeError:
+        print("[NEWS CHECK ERROR] Invalid JSON response, skipping this cycle")
+        return _news_cache["data"] or []
     except Exception as e:
         print(f"[NEWS CHECK ERROR] {e}")
+        return _news_cache["data"] or []
+
+
+def check_news_events():
+    events_found = []
+    events = _fetch_news_calendar()
+    if not events:
+        return events_found
+
+    now = datetime.now(pytz.utc)
+    for event in events:
+        if event.get("impact") != "High":
+            continue
+        title = event.get("title", "")
+        if not any(kw.lower() in title.lower() for kw in NEWS_KEYWORDS):
+            continue
+        try:
+            event_time = datetime.fromisoformat(event["date"].replace("Z", "+00:00"))
+            diff_min = (event_time - now).total_seconds() / 60
+            event_id = f"{title}_{event['date']}"
+            if 0 <= diff_min <= 60 and event_id not in _alerted_news_ids:
+                events_found.append({
+                    "id": event_id, "title": title,
+                    "time_ist": event_time.astimezone(IST),
+                    "minutes_away": round(diff_min),
+                    "currency": event.get("country", ""),
+                })
+        except Exception:
+            continue
     return events_found
 
 
 def is_high_impact_news_now():
-    try:
-        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-        r = requests.get(url, timeout=10)
-        events = r.json()
-        now = datetime.now(pytz.utc)
-        for event in events:
-            if event.get("impact") != "High":
-                continue
-            title = event.get("title", "")
-            if not any(kw.lower() in title.lower() for kw in NEWS_KEYWORDS):
-                continue
-            try:
-                event_time = datetime.fromisoformat(event["date"].replace("Z", "+00:00"))
-                diff = abs((event_time - now).total_seconds() / 60)
-                if diff <= 30:
-                    print(f"[NEWS SKIP] High impact event in {diff:.0f} min: {title}")
-                    return True
-            except Exception:
-                continue
-    except Exception as e:
-        print(f"[NEWS CHECK ERROR] {e}")
+    events = _fetch_news_calendar()
+    if not events:
+        return False
+
+    now = datetime.now(pytz.utc)
+    for event in events:
+        if event.get("impact") != "High":
+            continue
+        title = event.get("title", "")
+        if not any(kw.lower() in title.lower() for kw in NEWS_KEYWORDS):
+            continue
+        try:
+            event_time = datetime.fromisoformat(event["date"].replace("Z", "+00:00"))
+            diff = abs((event_time - now).total_seconds() / 60)
+            if diff <= 30:
+                print(f"[NEWS SKIP] High impact event in {diff:.0f} min: {title}")
+                return True
+        except Exception:
+            continue
     return False
 
 
