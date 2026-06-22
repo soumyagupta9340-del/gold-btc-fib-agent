@@ -22,8 +22,8 @@ GOOGLE_SHEETS_URL  = os.environ.get("GOOGLE_SHEETS_URL", "https://script.google.
 IST = pytz.timezone("Asia/Kolkata")
 
 ASSETS = {
-    "XAUUSD": {"symbol": "XAU/USD", "name": "GOLD", "emoji": "\U0001F947", "max_sl": 8, "interval": "1min"},
-    "BTCUSDT": {"symbol": "BTC/USD", "name": "BITCOIN", "emoji": "\u20BF", "max_sl": 200, "interval": "1min"},
+    "XAUUSD": {"symbol": "XAU/USD", "name": "GOLD", "emoji": "\U0001F947", "min_sl": 3, "max_sl": 8, "interval": "1min"},
+    "BTCUSDT": {"symbol": "BTC/USD", "name": "BITCOIN", "emoji": "\u20BF", "min_sl": 50, "max_sl": 200, "interval": "1min"},
 }
 
 SESSIONS = [
@@ -96,13 +96,21 @@ def fetch_candles(symbol, interval="1min", outputsize=500):
 
 
 def fetch_latest_price(symbol):
-    url = "https://api.twelvedata.com/price"
-    params = {"symbol": symbol, "apikey": TWELVE_DATA_KEY}
+    """
+    Gets latest price from most recent 1min candle close.
+    More reliable than /price endpoint which can return stale data.
+    """
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": symbol, "interval": "1min",
+        "outputsize": 2, "apikey": TWELVE_DATA_KEY,
+        "timezone": "Asia/Kolkata",
+    }
     try:
         r = requests.get(url, params=params, timeout=10)
         data = r.json()
-        if "price" in data:
-            return float(data["price"])
+        if "values" in data and len(data["values"]) > 0:
+            return float(data["values"][0]["close"])
     except Exception as e:
         print(f"[PRICE FETCH ERROR] {symbol}: {e}")
     return None
@@ -189,43 +197,70 @@ def detect_sweep(df, fib_level, bias):
     return None
 
 
-def detect_entry(df, sweep, bias, max_sl):
+def detect_entry(df, sweep, bias, min_sl, max_sl):
     df = calculate_ema(df)
     sweep_time = sweep["time"]
     window_end = sweep_time + timedelta(minutes=ENTRY_WINDOW_MIN)
     now = datetime.now(IST)
     entry_df = df[(df["datetime"] > sweep_time) & (df["datetime"] <= min(window_end, now))].copy()
 
+    # Get Fib range (High and Low used for Fib calculation)
+    today = now.date()
+    range_start = IST.localize(datetime(today.year, today.month, today.day, RANGE_START_HOUR, 0))
+    fib_df = df[df["datetime"] >= range_start]
+    fib_high = round(fib_df["high"].max(), 4) if not fib_df.empty else 0
+    fib_low  = round(fib_df["low"].min(), 4) if not fib_df.empty else 0
+
     for _, candle in entry_df.iterrows():
         ema20 = candle[f"ema{EMA_SLOW}"]
 
         if bias == "BUY" and candle["close"] > ema20:
             if is_full_body_candle(candle, "BUY"):
-                sl = candle["low"]
+                sl    = candle["low"]
                 entry = candle["close"]
                 sl_distance = entry - sl
+
+                if sl_distance < min_sl:
+                    print(f"[SKIP] SL too tight: ${sl_distance:.2f} < ${min_sl}")
+                    return None
                 if sl_distance > max_sl:
                     print(f"[SKIP] SL too wide: ${sl_distance:.2f} > ${max_sl}")
                     return None
+
                 tp1 = entry + (sl_distance * 2)
                 tp2 = entry + (sl_distance * 3.5)
-                return {"direction": "BUY", "entry": round(entry, 4), "sl": round(sl, 4),
-                        "tp1": round(tp1, 4), "tp2": round(tp2, 4), "sl_dist": round(sl_distance, 4),
-                        "rr1": "1:2", "rr2": "1:3.5", "candle_time": candle["datetime"]}
+                return {
+                    "direction": "BUY", "entry": round(entry, 4), "sl": round(sl, 4),
+                    "tp1": round(tp1, 4), "tp2": round(tp2, 4),
+                    "sl_dist": round(sl_distance, 4),
+                    "rr1": "1:2", "rr2": "1:3.5",
+                    "candle_time": candle["datetime"],
+                    "fib_high": fib_high, "fib_low": fib_low,
+                }
 
         elif bias == "SELL" and candle["close"] < ema20:
             if is_full_body_candle(candle, "SELL"):
-                sl = candle["high"]
+                sl    = candle["high"]
                 entry = candle["close"]
                 sl_distance = sl - entry
+
+                if sl_distance < min_sl:
+                    print(f"[SKIP] SL too tight: ${sl_distance:.2f} < ${min_sl}")
+                    return None
                 if sl_distance > max_sl:
                     print(f"[SKIP] SL too wide: ${sl_distance:.2f} > ${max_sl}")
                     return None
+
                 tp1 = entry - (sl_distance * 2)
                 tp2 = entry - (sl_distance * 3.5)
-                return {"direction": "SELL", "entry": round(entry, 4), "sl": round(sl, 4),
-                        "tp1": round(tp1, 4), "tp2": round(tp2, 4), "sl_dist": round(sl_distance, 4),
-                        "rr1": "1:2", "rr2": "1:3.5", "candle_time": candle["datetime"]}
+                return {
+                    "direction": "SELL", "entry": round(entry, 4), "sl": round(sl, 4),
+                    "tp1": round(tp1, 4), "tp2": round(tp2, 4),
+                    "sl_dist": round(sl_distance, 4),
+                    "rr1": "1:2", "rr2": "1:3.5",
+                    "candle_time": candle["datetime"],
+                    "fib_high": fib_high, "fib_low": fib_low,
+                }
 
     return None
 
@@ -352,6 +387,15 @@ def get_active_session():
 def format_signal(asset_key, signal, sweep, session, bias):
     asset = ASSETS[asset_key]
     direction_emoji = "\U0001F7E2" if signal["direction"] == "BUY" else "\U0001F534"
+
+    # Fib direction line â€” clearly show which swing to which swing
+    fib_high = signal.get("fib_high", "?")
+    fib_low  = signal.get("fib_low", "?")
+    if bias == "BUY":
+        fib_range_line = f"\U0001F4CF <b>Fib Range:</b> Low {fib_low} \u2192 High {fib_high} (BUY bias)"
+    else:
+        fib_range_line = f"\U0001F4CF <b>Fib Range:</b> High {fib_high} \u2192 Low {fib_low} (SELL bias)"
+
     return (
         f"{asset['emoji']} <b>{asset['name']} SIGNAL</b> | {direction_emoji} <b>{signal['direction']}</b>\n"
         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
@@ -360,7 +404,8 @@ def format_signal(asset_key, signal, sweep, session, bias):
         f"\U0001F3AF <b>TP1:</b> {signal['tp1']} ({signal['rr1']}) -> 50% close\n"
         f"\U0001F3AF <b>TP2:</b> {signal['tp2']} ({signal['rr2']}) -> remaining\n"
         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        f"\U0001F4CA <b>Fib 38.2%:</b> {sweep['fib_level']}\n"
+        f"{fib_range_line}\n"
+        f"\U0001F4CA <b>Fib 38.2% Level:</b> {sweep['fib_level']}\n"
         f"\U0001F4C8 <b>Trend Bias:</b> {bias}\n"
         f"\u23F0 <b>Session:</b> {session}\n"
         f"\U0001F550 <b>Signal Time:</b> {signal['candle_time'].strftime('%H:%M IST')}\n"
@@ -551,6 +596,12 @@ class FibAgent:
         self.last_sweep = {k: None for k in ASSETS}
         self.last_bias = {k: None for k in ASSETS}
         self.active_trades = {k: None for k in ASSETS}
+        # Confirmation counters â€” SL/TP must be confirmed 3 times before triggering
+        self.sl_confirm_count  = {k: 0 for k in ASSETS}
+        self.tp1_confirm_count = {k: 0 for k in ASSETS}
+        self.tp2_confirm_count = {k: 0 for k in ASSETS}
+        self.be_confirm_count  = {k: 0 for k in ASSETS}
+        CONFIRM_NEEDED = 3  # Number of consecutive confirmations required
 
     def send_daily_bias_report(self):
         global _bias_report_sent_date
@@ -613,57 +664,118 @@ class FibAgent:
     def check_active_trade(self, asset_key):
         trade = self.active_trades[asset_key]
         if trade is None:
+            # Reset all counters when no active trade
+            self.sl_confirm_count[asset_key]  = 0
+            self.tp1_confirm_count[asset_key] = 0
+            self.tp2_confirm_count[asset_key] = 0
+            self.be_confirm_count[asset_key]  = 0
             return
+
         asset = ASSETS[asset_key]
         price = fetch_latest_price(asset["symbol"])
         if price is None:
             return
+
         direction = trade["direction"]
+        CONFIRM_NEEDED = 3  # 3 consecutive scans (~3 min) before triggering
 
         if direction == "BUY":
-            # Breakeven shift at 1:1.5 RR
+            # --- Breakeven check ---
             if not trade.get("breakeven_done") and price >= trade["breakeven_trigger"]:
-                trade["sl"] = trade["entry"]
-                trade["breakeven_done"] = True
-                send_telegram(format_breakeven_alert(asset_key, trade))
-                print(f"[BREAKEVEN] {asset_key} SL moved to entry {trade['entry']}")
+                self.be_confirm_count[asset_key] += 1
+                if self.be_confirm_count[asset_key] >= CONFIRM_NEEDED:
+                    trade["sl"] = trade["entry"]
+                    trade["breakeven_done"] = True
+                    self.be_confirm_count[asset_key] = 0
+                    send_telegram(format_breakeven_alert(asset_key, trade))
+                    print(f"[BREAKEVEN] {asset_key} SL moved to entry {trade['entry']}")
+            else:
+                self.be_confirm_count[asset_key] = 0
 
+            # --- TP1 check ---
             if not trade.get("tp1_hit") and price >= trade["tp1"]:
-                send_telegram(format_tp_sl_hit(asset_key, trade, "TP1", price))
-                trade["tp1_hit"] = True
-            if price >= trade["tp2"]:
-                send_telegram(format_tp_sl_hit(asset_key, trade, "TP2", price))
-                log_trade_result(asset_key, trade, "TP2", price)
-                self.active_trades[asset_key] = None
-                return
-            if price <= trade["sl"]:
-                hit_label = "BREAKEVEN" if trade.get("breakeven_done") else "SL"
-                send_telegram(format_tp_sl_hit(asset_key, trade, hit_label, price))
-                log_trade_result(asset_key, trade, hit_label, price)
-                self.active_trades[asset_key] = None
-                return
-        else:
-            # Breakeven shift at 1:1.5 RR
-            if not trade.get("breakeven_done") and price <= trade["breakeven_trigger"]:
-                trade["sl"] = trade["entry"]
-                trade["breakeven_done"] = True
-                send_telegram(format_breakeven_alert(asset_key, trade))
-                print(f"[BREAKEVEN] {asset_key} SL moved to entry {trade['entry']}")
+                self.tp1_confirm_count[asset_key] += 1
+                if self.tp1_confirm_count[asset_key] >= CONFIRM_NEEDED:
+                    send_telegram(format_tp_sl_hit(asset_key, trade, "TP1", price))
+                    trade["tp1_hit"] = True
+                    self.tp1_confirm_count[asset_key] = 0
+            else:
+                self.tp1_confirm_count[asset_key] = 0
 
+            # --- TP2 check ---
+            if price >= trade["tp2"]:
+                self.tp2_confirm_count[asset_key] += 1
+                if self.tp2_confirm_count[asset_key] >= CONFIRM_NEEDED:
+                    send_telegram(format_tp_sl_hit(asset_key, trade, "TP2", price))
+                    log_trade_result(asset_key, trade, "TP2", price)
+                    self.active_trades[asset_key] = None
+                    self.tp2_confirm_count[asset_key] = 0
+                    return
+            else:
+                self.tp2_confirm_count[asset_key] = 0
+
+            # --- SL check ---
+            if price <= trade["sl"]:
+                self.sl_confirm_count[asset_key] += 1
+                print(f"[SL WATCH] {asset_key} BUY | Price {price} <= SL {trade['sl']} | Confirm {self.sl_confirm_count[asset_key]}/{CONFIRM_NEEDED}")
+                if self.sl_confirm_count[asset_key] >= CONFIRM_NEEDED:
+                    hit_label = "BREAKEVEN" if trade.get("breakeven_done") else "SL"
+                    send_telegram(format_tp_sl_hit(asset_key, trade, hit_label, price))
+                    log_trade_result(asset_key, trade, hit_label, price)
+                    self.active_trades[asset_key] = None
+                    self.sl_confirm_count[asset_key] = 0
+                    return
+            else:
+                self.sl_confirm_count[asset_key] = 0  # Reset if price recovers
+
+        else:  # SELL
+            # --- Breakeven check ---
+            if not trade.get("breakeven_done") and price <= trade["breakeven_trigger"]:
+                self.be_confirm_count[asset_key] += 1
+                if self.be_confirm_count[asset_key] >= CONFIRM_NEEDED:
+                    trade["sl"] = trade["entry"]
+                    trade["breakeven_done"] = True
+                    self.be_confirm_count[asset_key] = 0
+                    send_telegram(format_breakeven_alert(asset_key, trade))
+                    print(f"[BREAKEVEN] {asset_key} SL moved to entry {trade['entry']}")
+            else:
+                self.be_confirm_count[asset_key] = 0
+
+            # --- TP1 check ---
             if not trade.get("tp1_hit") and price <= trade["tp1"]:
-                send_telegram(format_tp_sl_hit(asset_key, trade, "TP1", price))
-                trade["tp1_hit"] = True
+                self.tp1_confirm_count[asset_key] += 1
+                if self.tp1_confirm_count[asset_key] >= CONFIRM_NEEDED:
+                    send_telegram(format_tp_sl_hit(asset_key, trade, "TP1", price))
+                    trade["tp1_hit"] = True
+                    self.tp1_confirm_count[asset_key] = 0
+            else:
+                self.tp1_confirm_count[asset_key] = 0
+
+            # --- TP2 check ---
             if price <= trade["tp2"]:
-                send_telegram(format_tp_sl_hit(asset_key, trade, "TP2", price))
-                log_trade_result(asset_key, trade, "TP2", price)
-                self.active_trades[asset_key] = None
-                return
+                self.tp2_confirm_count[asset_key] += 1
+                if self.tp2_confirm_count[asset_key] >= CONFIRM_NEEDED:
+                    send_telegram(format_tp_sl_hit(asset_key, trade, "TP2", price))
+                    log_trade_result(asset_key, trade, "TP2", price)
+                    self.active_trades[asset_key] = None
+                    self.tp2_confirm_count[asset_key] = 0
+                    return
+            else:
+                self.tp2_confirm_count[asset_key] = 0
+
+            # --- SL check ---
             if price >= trade["sl"]:
-                hit_label = "BREAKEVEN" if trade.get("breakeven_done") else "SL"
-                send_telegram(format_tp_sl_hit(asset_key, trade, hit_label, price))
-                log_trade_result(asset_key, trade, hit_label, price)
-                self.active_trades[asset_key] = None
-                return
+                self.sl_confirm_count[asset_key] += 1
+                print(f"[SL WATCH] {asset_key} SELL | Price {price} >= SL {trade['sl']} | Confirm {self.sl_confirm_count[asset_key]}/{CONFIRM_NEEDED}")
+                if self.sl_confirm_count[asset_key] >= CONFIRM_NEEDED:
+                    hit_label = "BREAKEVEN" if trade.get("breakeven_done") else "SL"
+                    send_telegram(format_tp_sl_hit(asset_key, trade, hit_label, price))
+                    log_trade_result(asset_key, trade, hit_label, price)
+                    self.active_trades[asset_key] = None
+                    self.sl_confirm_count[asset_key] = 0
+                    return
+            else:
+                self.sl_confirm_count[asset_key] = 0  # Reset if price recovers
 
     def run_asset(self, asset_key):
         asset = ASSETS[asset_key]
@@ -715,7 +827,7 @@ class FibAgent:
                 self.last_sweep[asset_key] = sweep
                 print(f"[SWEEP] {asset_key} - Sweep detected at {fib_level}")
 
-            signal = detect_entry(df, sweep, bias, asset["max_sl"])
+            signal = detect_entry(df, sweep, bias, asset["min_sl"], asset["max_sl"])
 
             if signal:
                 last = self.last_signal_time[asset_key]
