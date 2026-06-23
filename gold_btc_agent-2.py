@@ -12,6 +12,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import pytz
+import threading
 
 # CONFIG - Fill these in Railway Environment
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "your_bot_token_here")
@@ -38,7 +39,7 @@ FIB_LEVEL = 0.382
 EMA_FAST = 9
 EMA_SLOW = 20
 ENTRY_WINDOW_MIN = 60
-SCAN_INTERVAL_S = 60
+SCAN_INTERVAL_S = 15  # Scan every 15 seconds for fast signal delivery
 
 NEWS_KEYWORDS = [
     "NFP", "CPI", "Fed", "FOMC", "Interest Rate",
@@ -55,15 +56,20 @@ _trade_journal = []
 _journal_report_sent_date = None
 
 
-def send_telegram(message):
+def send_telegram(message, retries=3):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHANNEL, "text": message, "parse_mode": "HTML"}
-    try:
-        r = requests.post(url, json=payload, timeout=10)
-        r.raise_for_status()
-        print(f"[TG SENT] {message[:60]}...")
-    except Exception as e:
-        print(f"[TG ERROR] {e}")
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.post(url, json=payload, timeout=8)
+            r.raise_for_status()
+            print(f"[TG SENT] {message[:60]}...")
+            return  # Success
+        except Exception as e:
+            print(f"[TG ERROR] Attempt {attempt}/{retries}: {e}")
+            if attempt < retries:
+                time.sleep(2)  # Wait 2s before retry
+    print(f"[TG FAILED] Could not send after {retries} attempts")
 
 
 def fetch_candles(symbol, interval="1min", outputsize=500):
@@ -880,9 +886,14 @@ class FibAgent:
                 self.send_daily_bias_report()
                 self.send_daily_journal_report()
 
+                # Scan Gold and BTC in parallel threads for faster signal delivery
+                threads = []
                 for asset_key in ASSETS:
-                    self.run_asset(asset_key)
-                    time.sleep(2)
+                    t = threading.Thread(target=self.run_asset, args=(asset_key,), daemon=True)
+                    threads.append(t)
+                    t.start()
+                for t in threads:
+                    t.join(timeout=30)  # Max 30s wait per asset thread
 
                 print(f"\n[SLEEP] Next scan in {SCAN_INTERVAL_S}s...")
                 time.sleep(SCAN_INTERVAL_S)
