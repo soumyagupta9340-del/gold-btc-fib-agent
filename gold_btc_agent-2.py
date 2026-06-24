@@ -13,6 +13,12 @@ import numpy as np
 from datetime import datetime, timedelta
 import pytz
 import threading
+import matplotlib
+matplotlib.use("Agg")  # Non-interactive backend for server
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.patches import FancyArrowPatch
+import io
 
 # CONFIG - Fill these in Railway Environment
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "your_bot_token_here")
@@ -64,62 +70,290 @@ def send_telegram(message, retries=3):
             r = requests.post(url, json=payload, timeout=8)
             r.raise_for_status()
             print(f"[TG SENT] {message[:60]}...")
-            return  # Success
+            return
         except Exception as e:
             print(f"[TG ERROR] Attempt {attempt}/{retries}: {e}")
             if attempt < retries:
-                time.sleep(2)  # Wait 2s before retry
+                time.sleep(2)
     print(f"[TG FAILED] Could not send after {retries} attempts")
 
 
-def fetch_candles(symbol, interval="1min", outputsize=500):
-    url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": symbol, "interval": interval, "outputsize": outputsize,
-        "apikey": TWELVE_DATA_KEY, "timezone": "Asia/Kolkata",
-    }
+def send_telegram_photo(image_bytes, caption, retries=3):
+    """Sends a chart image to Telegram with caption."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    for attempt in range(1, retries + 1):
+        try:
+            image_bytes.seek(0)
+            r = requests.post(
+                url,
+                data={"chat_id": TELEGRAM_CHANNEL, "caption": caption, "parse_mode": "HTML"},
+                files={"photo": ("chart.png", image_bytes, "image/png")},
+                timeout=15,
+            )
+            r.raise_for_status()
+            print(f"[TG PHOTO SENT] Chart delivered successfully")
+            return True
+        except Exception as e:
+            print(f"[TG PHOTO ERROR] Attempt {attempt}/{retries}: {e}")
+            if attempt < retries:
+                time.sleep(2)
+    return False
+
+
+def generate_signal_chart(df, signal, sweep, bias, asset_key):
+    """
+    Generates a clean TradingView-style candlestick chart with:
+    - Last 60 candles
+    - 9 EMA & 20 EMA
+    - Fib 38.2% level
+    - Entry, SL, TP1, TP2 horizontal lines
+    - Sweep candle highlighted
+    Returns image as BytesIO buffer.
+    """
+    asset = ASSETS[asset_key]
+
+    # Get last 60 candles for chart
+    df = df.tail(60).copy().reset_index(drop=True)
+
+    # Calculate EMAs
+    df["ema9"]  = df["close"].ewm(span=9,  adjust=False).mean()
+    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+    fig.patch.set_facecolor("#0d1117")
+    ax.set_facecolor("#0d1117")
+
+    # Draw candlesticks
+    for i, row in df.iterrows():
+        color = "#26a69a" if row["close"] >= row["open"] else "#ef5350"
+        # Wick
+        ax.plot([i, i], [row["low"], row["high"]], color=color, linewidth=0.8)
+        # Body
+        body_bottom = min(row["open"], row["close"])
+        body_height = abs(row["close"] - row["open"])
+        rect = plt.Rectangle((i - 0.3, body_bottom), 0.6, body_height,
+                               color=color, zorder=3)
+        ax.add_patch(rect)
+
+    x_range = range(len(df))
+
+    # EMA lines
+    ax.plot(x_range, df["ema9"],  color="#f5a623", linewidth=1.2, label="EMA 9",  zorder=4)
+    ax.plot(x_range, df["ema20"], color="#4fc3f7", linewidth=1.2, label="EMA 20", zorder=4)
+
+    # Fib 38.2% level
+    fib_lvl = sweep["fib_level"]
+    ax.axhline(y=fib_lvl, color="#9c27b0", linewidth=1,
+               linestyle="--", alpha=0.8, label=f"Fib 38.2% {fib_lvl}", zorder=4)
+
+    # Key levels
+    levels = [
+        (signal["sl"],    "#ef5350", "SL",    "--"),
+        (signal["entry"], "#ffffff", "ENTRY", "-"),
+        (signal["tp1"],   "#66bb6a", "TP1",   "-."),
+        (signal["tp2"],   "#26a69a", "TP2",   "-."),
+    ]
+    for price, color, label, ls in levels:
+        ax.axhline(y=price, color=color, linewidth=1.3,
+                   linestyle=ls, alpha=0.9, zorder=5)
+        ax.text(len(df) - 0.5, price, f" {label}: {price}",
+                color=color, fontsize=8, va="center",
+                fontweight="bold", zorder=6)
+
+    # Highlight sweep candle (find it in df)
+    sweep_time = sweep["time"]
+    sweep_matches = df[df.index == df.index[-1]]  # fallback
+    for i, row in df.iterrows():
+        if abs((row.get("datetime", sweep_time) - sweep_time).total_seconds()
+               if hasattr(row.get("datetime", None), "total_seconds") else 999) < 120:
+            ax.axvspan(i - 0.5, i + 0.5, color="#f5a623", alpha=0.15, zorder=2)
+            break
+
+    # Direction arrow
+    arrow_x = len(df) * 0.15
+    if bias == "BUY":
+        ax.annotate("", xy=(arrow_x, signal["tp1"]),
+                    xytext=(arrow_x, signal["sl"]),
+                    arrowprops=dict(arrowstyle="->", color="#26a69a", lw=2))
+    else:
+        ax.annotate("", xy=(arrow_x, signal["tp1"]),
+                    xytext=(arrow_x, signal["sl"]),
+                    arrowprops=dict(arrowstyle="->", color="#ef5350", lw=2))
+
+    # Labels & styling
+    direction_symbol = "â–² BUY" if bias == "BUY" else "â–¼ SELL"
+    ax.set_title(
+        f"{asset['emoji']} {asset['name']}  |  {direction_symbol}  |  "
+        f"Fib 38.2% Sweep  |  {signal['candle_time'].strftime('%d %b %Y  %H:%M IST')}",
+        color="white", fontsize=11, fontweight="bold", pad=12
+    )
+    ax.tick_params(colors="gray", labelsize=7)
+    ax.spines["bottom"].set_color("#2d2d2d")
+    ax.spines["top"].set_color("#2d2d2d")
+    ax.spines["left"].set_color("#2d2d2d")
+    ax.spines["right"].set_color("#2d2d2d")
+    ax.yaxis.tick_right()
+    ax.set_xlim(-1, len(df) + 8)
+
+    # Legend
+    legend = ax.legend(loc="upper left", fontsize=7,
+                       facecolor="#1a1a2e", edgecolor="#2d2d2d",
+                       labelcolor="white", framealpha=0.8)
+
+    # Watermark
+    ax.text(0.5, 0.5, "@Aigoldbitcoin_bot",
+            transform=ax.transAxes, fontsize=18,
+            color="white", alpha=0.04,
+            ha="center", va="center",
+            fontweight="bold", rotation=20)
+
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=130,
+                facecolor=fig.get_facecolor(), bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def _normalize_df(df):
+    """Normalize dataframe columns and localize datetime to IST."""
+    df = df.sort_values("datetime").reset_index(drop=True)
+    for col in ["open", "high", "low", "close", "volume"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    if df["datetime"].dt.tz is None:
+        df["datetime"] = df["datetime"].dt.tz_localize(IST)
+    else:
+        df["datetime"] = df["datetime"].dt.tz_convert(IST)
+    return df
+
+
+# â”€â”€ Gold cache (5 min) to keep Twelve Data within 800 calls/day â”€â”€
+_gold_cache = {"df": None, "fetched_at": None}
+GOLD_CACHE_SECONDS = 180  # 3 minutes â€” balances API limit vs sweep detection accuracy
+
+
+def fetch_candles_gold(outputsize=500):
+    """
+    Fetch Gold (XAU/USD) 1-min candles from Twelve Data.
+    Uses 5-minute cache to stay within 800 free calls/day.
+    Calculation: 24hr / 5min = 288 fetches/day â€” well within limit.
+    """
+    global _gold_cache
+    now_utc = datetime.now(pytz.utc)
+
+    # Return cached data if still fresh
+    if (
+        _gold_cache["df"] is not None
+        and _gold_cache["fetched_at"] is not None
+        and (now_utc - _gold_cache["fetched_at"]).total_seconds() < GOLD_CACHE_SECONDS
+    ):
+        age = int((now_utc - _gold_cache["fetched_at"]).total_seconds())
+        print(f"[GOLD CACHE] Returning cached data ({age}s old)")
+        return _gold_cache["df"]
+
+    # Fetch fresh data from Twelve Data
     try:
+        url = "https://api.twelvedata.com/time_series"
+        params = {
+            "symbol"    : "XAU/USD",
+            "interval"  : "1min",
+            "outputsize": outputsize,
+            "apikey"    : TWELVE_DATA_KEY,
+            "timezone"  : "Asia/Kolkata",
+        }
         r = requests.get(url, params=params, timeout=15)
         data = r.json()
+
         if "values" not in data:
-            print(f"[DATA ERROR] {symbol}: {data.get('message', 'Unknown error')}")
-            return pd.DataFrame()
+            msg = data.get("message", "Unknown error")
+            print(f"[GOLD FETCH ERROR] Twelve Data: {msg}")
+            # Return stale cache if available rather than empty
+            return _gold_cache["df"] if _gold_cache["df"] is not None else pd.DataFrame()
 
         df = pd.DataFrame(data["values"])
         df["datetime"] = pd.to_datetime(df["datetime"])
-        if df["datetime"].dt.tz is None:
-            df["datetime"] = df["datetime"].dt.tz_localize(IST)
-        else:
-            df["datetime"] = df["datetime"].dt.tz_convert(IST)
-        df = df.sort_values("datetime").reset_index(drop=True)
-        for col in ["open", "high", "low", "close", "volume"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = _normalize_df(df)
+
+        _gold_cache["df"] = df
+        _gold_cache["fetched_at"] = now_utc
+        print(f"[GOLD FETCH] Fresh data from Twelve Data ({len(df)} candles)")
         return df
+
     except Exception as e:
-        print(f"[FETCH ERROR] {symbol}: {e}")
+        print(f"[GOLD FETCH ERROR] {e}")
+        return _gold_cache["df"] if _gold_cache["df"] is not None else pd.DataFrame()
+
+
+def fetch_candles_btc(outputsize=500):
+    """
+    Fetch BTC/USDT 1-min candles from Binance API.
+    Free, no API key, unlimited calls.
+    """
+    try:
+        url = "https://api.binance.com/api/v3/klines"
+        params = {"symbol": "BTCUSDT", "interval": "1m", "limit": outputsize}
+        r = requests.get(url, params=params, timeout=15)
+        data = r.json()
+
+        df = pd.DataFrame(data, columns=[
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time", "qav", "num_trades", "tbbav", "tbqav", "ignore"
+        ])
+        df["datetime"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+        df = df[["datetime", "open", "high", "low", "close", "volume"]]
+        df = df.dropna(subset=["close"])
+        return _normalize_df(df)
+    except Exception as e:
+        print(f"[BTC FETCH ERROR] Binance: {e}")
         return pd.DataFrame()
+
+
+def fetch_candles(symbol, interval="1min", outputsize=500):
+    """Router â€” Twelve Data (cached) for Gold, Binance for BTC."""
+    if "BTC" in symbol.upper():
+        return fetch_candles_btc(outputsize)
+    else:
+        return fetch_candles_gold(outputsize)
 
 
 def fetch_latest_price(symbol):
     """
-    Gets latest price from most recent 1min candle close.
-    More reliable than /price endpoint which can return stale data.
+    Gets latest REAL-TIME price â€” never uses cache.
+    Gold: Twelve Data /price (accurate forex spot price)
+    BTC:  Binance ticker (free, unlimited, real-time)
     """
-    url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": symbol, "interval": "1min",
-        "outputsize": 2, "apikey": TWELVE_DATA_KEY,
-        "timezone": "Asia/Kolkata",
-    }
-    try:
-        r = requests.get(url, params=params, timeout=10)
-        data = r.json()
-        if "values" in data and len(data["values"]) > 0:
-            return float(data["values"][0]["close"])
-    except Exception as e:
-        print(f"[PRICE FETCH ERROR] {symbol}: {e}")
-    return None
+    if "BTC" in symbol.upper():
+        try:
+            url = "https://api.binance.com/api/v3/ticker/price"
+            r = requests.get(url, params={"symbol": "BTCUSDT"}, timeout=8)
+            return float(r.json()["price"])
+        except Exception as e:
+            print(f"[BTC PRICE ERROR] {e}")
+            return None
+    else:
+        # Gold â€” always real-time from Twelve Data /price (1 API call only)
+        try:
+            url = "https://api.twelvedata.com/price"
+            params = {"symbol": "XAU/USD", "apikey": TWELVE_DATA_KEY}
+            r = requests.get(url, params=params, timeout=8)
+            data = r.json()
+            if "price" in data:
+                price = float(data["price"])
+                print(f"[GOLD PRICE] Real-time: ${price}")
+                return price
+            else:
+                # Fallback to latest candle close from cache
+                if _gold_cache["df"] is not None:
+                    return float(_gold_cache["df"].iloc[-1]["close"])
+        except Exception as e:
+            print(f"[GOLD PRICE ERROR] {e}")
+            # Fallback to cache if API fails
+            if _gold_cache["df"] is not None:
+                return float(_gold_cache["df"].iloc[-1]["close"])
+        return None
 
 
 def get_trend_bias(df):
@@ -842,7 +1076,18 @@ class FibAgent:
                     return
 
                 msg = format_signal(asset_key, signal, sweep, session, bias)
-                send_telegram(msg)
+
+                # Generate and send chart image with signal as caption
+                try:
+                    chart_buf = generate_signal_chart(df, signal, sweep, bias, asset_key)
+                    sent = send_telegram_photo(chart_buf, msg)
+                    if not sent:
+                        # Fallback to text-only if photo fails
+                        send_telegram(msg)
+                except Exception as chart_err:
+                    print(f"[CHART ERROR] {chart_err} â€” sending text only")
+                    send_telegram(msg)
+
                 self.last_signal_time[asset_key] = datetime.now(IST)
                 self.sweep_alerted[asset_key] = False
 
