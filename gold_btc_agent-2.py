@@ -55,7 +55,7 @@ _bias_report_sent_date = None
 _trade_journal = []
 _journal_report_sent_date = None
 
-# API Cache â€” reduces Twelve Data calls to stay within 800/day free limit
+# API Cache Ã¢â‚¬â€ reduces Twelve Data calls to stay within 800/day free limit
 # Gold: cache 3 min = 480 calls/day | BTC: cache 3 min = 480 calls/day | Total ~580 = safe
 _candle_cache = {
     "XAUUSD": {"df": None, "fetched_at": None},
@@ -81,32 +81,62 @@ def send_telegram(message, retries=3):
 
 
 def fetch_candles(symbol, interval="1min", outputsize=500):
-    # Check cache first
     asset_key = "BTCUSDT" if "BTC" in symbol.upper() else "XAUUSD"
     cache = _candle_cache[asset_key]
     now_utc = datetime.now(pytz.utc)
 
+    # â”€â”€ BTC: Binance API (free, unlimited, real-time, no API key needed) â”€â”€
+    if asset_key == "BTCUSDT":
+        if (
+            cache["df"] is not None and cache["fetched_at"] is not None
+            and (now_utc - cache["fetched_at"]).total_seconds() < 30
+        ):
+            print(f"[CACHE] BTC ({int((now_utc - cache['fetched_at']).total_seconds())}s old)")
+            return cache["df"]
+        try:
+            r = requests.get(
+                "https://api.binance.com/api/v3/klines",
+                params={"symbol": "BTCUSDT", "interval": "1m", "limit": 500},
+                timeout=10,
+            )
+            data = r.json()
+            df = pd.DataFrame(data, columns=[
+                "open_time","open","high","low","close","volume",
+                "close_time","qav","num_trades","tbbav","tbqav","ignore"
+            ])
+            df["datetime"] = pd.to_datetime(df["open_time"], unit="ms", utc=True).dt.tz_convert(IST)
+            df = df[["datetime","open","high","low","close","volume"]].copy()
+            for col in ["open","high","low","close","volume"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            df = df.dropna(subset=["close"]).sort_values("datetime").reset_index(drop=True)
+            _candle_cache["BTCUSDT"]["df"] = df
+            _candle_cache["BTCUSDT"]["fetched_at"] = now_utc
+            print(f"[FETCH] BTC from Binance ({len(df)} candles)")
+            return df
+        except Exception as e:
+            print(f"[BTC FETCH ERROR] {e}")
+            return cache["df"] if cache["df"] is not None else pd.DataFrame()
+
+    # â”€â”€ GOLD: Twelve Data â€” only 100 candles (faster fetch), 3 min cache â”€â”€
     if (
-        cache["df"] is not None
-        and cache["fetched_at"] is not None
+        cache["df"] is not None and cache["fetched_at"] is not None
         and (now_utc - cache["fetched_at"]).total_seconds() < CACHE_SECONDS
     ):
-        age = int((now_utc - cache["fetched_at"]).total_seconds())
-        print(f"[CACHE] {asset_key} using cached data ({age}s old)")
+        print(f"[CACHE] GOLD ({int((now_utc - cache['fetched_at']).total_seconds())}s old)")
         return cache["df"]
-
-    # Fetch fresh from Twelve Data
-    url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": symbol, "interval": interval, "outputsize": outputsize,
-        "apikey": TWELVE_DATA_KEY, "timezone": "Asia/Kolkata",
-    }
     try:
-        r = requests.get(url, params=params, timeout=15)
+        r = requests.get(
+            "https://api.twelvedata.com/time_series",
+            params={
+                "symbol": symbol, "interval": interval,
+                "outputsize": 100,  # Only 100 candles â€” much faster than 500
+                "apikey": TWELVE_DATA_KEY, "timezone": "Asia/Kolkata",
+            },
+            timeout=10,
+        )
         data = r.json()
         if "values" not in data:
-            print(f"[DATA ERROR] {symbol}: {data.get('message', 'Unknown error')}")
-            # Return stale cache if available
+            print(f"[GOLD ERROR] {data.get('message','Unknown')}")
             return cache["df"] if cache["df"] is not None else pd.DataFrame()
 
         df = pd.DataFrame(data["values"])
@@ -116,52 +146,55 @@ def fetch_candles(symbol, interval="1min", outputsize=500):
         else:
             df["datetime"] = df["datetime"].dt.tz_convert(IST)
         df = df.sort_values("datetime").reset_index(drop=True)
-        for col in ["open", "high", "low", "close", "volume"]:
+        for col in ["open","high","low","close","volume"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        # Save to cache
-        _candle_cache[asset_key]["df"] = df
-        _candle_cache[asset_key]["fetched_at"] = now_utc
-        print(f"[FETCH] {asset_key} fresh data fetched ({len(df)} candles)")
+        _candle_cache["XAUUSD"]["df"] = df
+        _candle_cache["XAUUSD"]["fetched_at"] = now_utc
+        print(f"[FETCH] GOLD from Twelve Data ({len(df)} candles)")
         return df
     except Exception as e:
-        print(f"[FETCH ERROR] {symbol}: {e}")
+        print(f"[GOLD FETCH ERROR] {e}")
         return cache["df"] if cache["df"] is not None else pd.DataFrame()
 
-
 def fetch_latest_price(symbol):
-    """
-    Gets latest price â€” uses cache if fresh, else hits /price endpoint (1 call only).
-    """
     asset_key = "BTCUSDT" if "BTC" in symbol.upper() else "XAUUSD"
     cache = _candle_cache[asset_key]
     now_utc = datetime.now(pytz.utc)
 
-    # Use cache if fresh (saves API calls)
+    # BTC â€” Binance real-time ticker (unlimited, instant)
+    if asset_key == "BTCUSDT":
+        try:
+            r = requests.get(
+                "https://api.binance.com/api/v3/ticker/price",
+                params={"symbol": "BTCUSDT"}, timeout=6,
+            )
+            return float(r.json()["price"])
+        except Exception as e:
+            print(f"[BTC PRICE ERROR] {e}")
+            if cache["df"] is not None:
+                return float(cache["df"].iloc[-1]["close"])
+            return None
+
+    # GOLD â€” use cache if fresh, else /price endpoint (1 call only)
     if (
-        cache["df"] is not None
-        and cache["fetched_at"] is not None
+        cache["df"] is not None and cache["fetched_at"] is not None
         and (now_utc - cache["fetched_at"]).total_seconds() < CACHE_SECONDS
     ):
         return float(cache["df"].iloc[-1]["close"])
-
-    # Cache stale â€” hit lightweight /price endpoint (1 call only)
     try:
-        url = "https://api.twelvedata.com/price"
-        params = {"symbol": symbol, "apikey": TWELVE_DATA_KEY}
-        r = requests.get(url, params=params, timeout=8)
+        r = requests.get(
+            "https://api.twelvedata.com/price",
+            params={"symbol": symbol, "apikey": TWELVE_DATA_KEY}, timeout=6,
+        )
         data = r.json()
         if "price" in data:
             return float(data["price"])
     except Exception as e:
-        print(f"[PRICE FETCH ERROR] {symbol}: {e}")
-
-    # Last resort â€” stale cache
+        print(f"[GOLD PRICE ERROR] {e}")
     if cache["df"] is not None:
         return float(cache["df"].iloc[-1]["close"])
     return None
-
 
 def get_trend_bias(df):
     now = datetime.now(IST)
@@ -435,7 +468,7 @@ def format_signal(asset_key, signal, sweep, session, bias):
     asset = ASSETS[asset_key]
     direction_emoji = "\U0001F7E2" if signal["direction"] == "BUY" else "\U0001F534"
 
-    # Fib direction line â€” clearly show which swing to which swing
+    # Fib direction line Ã¢â‚¬â€ clearly show which swing to which swing
     fib_high = signal.get("fib_high", "?")
     fib_low  = signal.get("fib_low", "?")
     if bias == "BUY":
@@ -643,7 +676,7 @@ class FibAgent:
         self.last_sweep = {k: None for k in ASSETS}
         self.last_bias = {k: None for k in ASSETS}
         self.active_trades = {k: None for k in ASSETS}
-        # Confirmation counters â€” SL/TP must be confirmed 3 times before triggering
+        # Confirmation counters Ã¢â‚¬â€ SL/TP must be confirmed 3 times before triggering
         self.sl_confirm_count  = {k: 0 for k in ASSETS}
         self.tp1_confirm_count = {k: 0 for k in ASSETS}
         self.tp2_confirm_count = {k: 0 for k in ASSETS}
